@@ -1011,6 +1011,8 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
 # =============================================================================
 
 def main():
+    global DATA_DIR, T1N_DIR, SPLIT_JSON, OUT_DIR, LOG_DIR, ARTIFACT_DIR
+    global NUM_PATCHES, BATCH_SIZE
     parser = argparse.ArgumentParser(description="BraTS T1n - MRI-EDAIN v2")
     parser.add_argument("--fold", type=int, default=None, choices=[0, 1, 2, 3, 4])
     parser.add_argument("--gpu", type=int, default=0)
@@ -1029,10 +1031,22 @@ def main():
         help="Override output / log / artifact root. "
              "Default: ./outputs/brats_mri_edain_v2 (and matching logs/, artifacts/).",
     )
+    parser.add_argument(
+        "--num_patches", type=int, default=None,
+        help=f"Patches per training image (default {NUM_PATCHES}). "
+             f"Drop to 2 for 2080Ti-class GPUs (11 GB) if you hit OOM.",
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=None,
+        help=f"Train batch size (default {BATCH_SIZE}).",
+    )
     args = parser.parse_args()
 
     # Apply path overrides.
-    global DATA_DIR, T1N_DIR, SPLIT_JSON, OUT_DIR, LOG_DIR, ARTIFACT_DIR
+    if args.num_patches is not None:
+        NUM_PATCHES = int(args.num_patches)
+    if args.batch_size is not None:
+        BATCH_SIZE = int(args.batch_size)
     if args.data_dir is not None:
         DATA_DIR = Path(args.data_dir).resolve()
     T1N_DIR = DATA_DIR / "brats_t1n"

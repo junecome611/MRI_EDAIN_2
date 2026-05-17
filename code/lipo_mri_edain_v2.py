@@ -1062,6 +1062,8 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
 # =============================================================================
 
 def main():
+    global DATA_DIR, SPLIT_JSON, OUT_DIR, LOG_DIR, ARTIFACT_DIR
+    global NUM_PATCHES, BATCH_SIZE
     parser = argparse.ArgumentParser(description="Lipo MR - MRI-EDAIN v2")
     parser.add_argument("--fold", type=int, default=None,
                         help="Fold id from lipo_split.json (e.g. 0..4)")
@@ -1084,9 +1086,22 @@ def main():
         "--out_dir", type=str, default=None,
         help="Override output / log / artifact root.",
     )
+    parser.add_argument(
+        "--num_patches", type=int, default=None,
+        help=f"Patches per training image (default {NUM_PATCHES}). "
+             f"Drop to 2 for 2080Ti-class GPUs (11 GB) if you hit OOM.",
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=None,
+        help=f"Train batch size (default {BATCH_SIZE}).",
+    )
     args = parser.parse_args()
 
-    global DATA_DIR, SPLIT_JSON, OUT_DIR, LOG_DIR, ARTIFACT_DIR
+    if args.num_patches is not None:
+        NUM_PATCHES = int(args.num_patches)
+    if args.batch_size is not None:
+        BATCH_SIZE = int(args.batch_size)
+
     if args.data_dir is not None:
         DATA_DIR = Path(args.data_dir).resolve()
     if args.split_json is not None:

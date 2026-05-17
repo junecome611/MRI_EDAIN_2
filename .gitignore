@@ -1,0 +1,50 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual envs
+.venv/
+venv/
+env/
+.env
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Pytest / coverage
+.pytest_cache/
+**/.pytest_cache/
+.coverage
+htmlcov/
+
+# Training outputs (kept out of git -- live on cluster scratch)
+outputs/
+logs/
+artifacts/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Dataset (NEVER checked in)
+dataset/
+*.nii
+*.nii.gz
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Logs
+*.log
+slurm-*.out

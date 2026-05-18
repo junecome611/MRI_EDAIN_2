@@ -35,10 +35,12 @@ class LambdaScheduler:
         lambda_kl_final: float = 1.0e-4,
         kl_ramp_steps: int = 11250,  # 5% of phase 2 (default 225000 steps)
     ):
-        if not (0 < phase_0_end < phase_1_end <= total_steps):
+        # Allow phase_*_end > total_steps so callers can run "phase 0 forever"
+        # (= baseline #5 RQSplineFixed) by passing very large boundaries.
+        if not (0 < phase_0_end <= phase_1_end):
             raise ValueError(
-                f"need 0 < phase_0_end={phase_0_end} < phase_1_end={phase_1_end} "
-                f"<= total_steps={total_steps}"
+                f"need 0 < phase_0_end={phase_0_end} <= phase_1_end={phase_1_end}; "
+                f"total_steps={total_steps}"
             )
         self.total_steps = int(total_steps)
         self.phase_0_end = int(phase_0_end)

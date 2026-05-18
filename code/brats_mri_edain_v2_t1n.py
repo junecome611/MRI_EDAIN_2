@@ -620,6 +620,7 @@ def load_data_and_compute_fingerprint(smoke: bool = False,
 
 def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = None,
                sw_batch_size: int = 1, hypernet_lr_factor: float = 0.1,
+               frozen_hypernet: bool = False,
                artifact_path: Path = None):
     CURR_FOLD = fold_info["fold"]
     target_pixdim = fp["target_pixdim"]
@@ -802,9 +803,15 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
     # Approximate steps per epoch: |train_files| / batch * num_patches
     iter_per_epoch = max(1, len(fold_info["train_files"]) * NUM_PATCHES // BATCH_SIZE)
     total_steps = epochs_target * iter_per_epoch
-    phase_0_end = max(1, int(total_steps * 0.01))
-    phase_1_end = max(phase_0_end + 1, int(total_steps * 0.10))
-    kl_ramp = max(1, int((total_steps - phase_1_end) * 0.05))
+    if frozen_hypernet:
+        # Baseline #5 (RQSplineFixed): hypernet stays frozen entire training.
+        phase_0_end = total_steps + 1
+        phase_1_end = total_steps + 2
+        kl_ramp = 1
+    else:
+        phase_0_end = max(1, int(total_steps * 0.01))
+        phase_1_end = max(phase_0_end + 1, int(total_steps * 0.10))
+        kl_ramp = max(1, int((total_steps - phase_1_end) * 0.05))
     lambda_sched = LambdaScheduler(
         total_steps=total_steps,
         phase_0_end=phase_0_end,
@@ -814,7 +821,8 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
         lambda_kl_final=LAMBDA_KL_FINAL,
         kl_ramp_steps=kl_ramp,
     )
-    print(f"Schedule: {lambda_sched}")
+    print(f"Schedule: {lambda_sched}"
+          + (" [frozen_hypernet = baseline #5 RQSplineFixed]" if frozen_hypernet else ""))
 
     ema = EMAWrapper(model.edain.hypernet, decay=EMA_DECAY)
 
@@ -1134,6 +1142,11 @@ def main():
         help="Hypernet LR as fraction of backbone LR (default 0.1; blueprint "
              "section 5.2 fallback against phase 0->1 transition divergence).",
     )
+    parser.add_argument(
+        "--frozen_hypernet", action="store_true",
+        help="BASELINE #5 mode: keep hypernet frozen for the full training. "
+             "Spline = population Nyul. anc / KL stay at 0.",
+    )
     args = parser.parse_args()
 
     # Apply path overrides.
@@ -1189,17 +1202,20 @@ def main():
         fold_info = next(fo for fo in folds if fo["fold"] == args.fold)
         train_fold(fold_info, fp, device, smoke=args.smoke, max_epochs=args.epochs,
                    sw_batch_size=args.sw_batch_size,
-                   hypernet_lr_factor=args.hypernet_lr_factor)
+                   hypernet_lr_factor=args.hypernet_lr_factor,
+                   frozen_hypernet=args.frozen_hypernet)
     elif args.smoke:
         # Smoke runs fold 0 only.
         train_fold(folds[0], fp, device, smoke=True, max_epochs=args.epochs or 2,
                    sw_batch_size=args.sw_batch_size,
-                   hypernet_lr_factor=args.hypernet_lr_factor)
+                   hypernet_lr_factor=args.hypernet_lr_factor,
+                   frozen_hypernet=args.frozen_hypernet)
     else:
         for fold_info in folds:
             train_fold(fold_info, fp, device, max_epochs=args.epochs,
                        sw_batch_size=args.sw_batch_size,
-                       hypernet_lr_factor=args.hypernet_lr_factor)
+                       hypernet_lr_factor=args.hypernet_lr_factor,
+                       frozen_hypernet=args.frozen_hypernet)
 
     print("\n" + "=" * 70)
     print("DONE.")

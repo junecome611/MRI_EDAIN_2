@@ -709,7 +709,7 @@ def load_data_and_compute_fingerprint(data_dir: Path, split_json_path: Path,
 
 def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = None,
                artifact_path: Path = None, sw_batch_size: int = 1,
-               hypernet_lr_factor: float = 0.1):
+               hypernet_lr_factor: float = 0.1, frozen_hypernet: bool = False):
     CURR_FOLD = fold_info["fold"]
     target_pixdim = fp["target_pixdim"]
     patch_size = fp["patch_size"]
@@ -886,16 +886,25 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
 
     iter_per_epoch = max(1, len(fold_info["train_files"]) * NUM_PATCHES // BATCH_SIZE)
     total_steps = epochs_target * iter_per_epoch
-    phase_0_end = max(1, int(total_steps * 0.01))
-    phase_1_end = max(phase_0_end + 1, int(total_steps * 0.10))
-    kl_ramp = max(1, int((total_steps - phase_1_end) * 0.05))
+    if frozen_hypernet:
+        # Baseline #5 (RQSplineFixed) mode: hypernet stays frozen for the
+        # entire training. Phase scheduler is degenerate (phase = 0 forever).
+        # anc / KL stay at 0; only U-Net trains, on f_{theta_0}(X).
+        phase_0_end = total_steps + 1
+        phase_1_end = total_steps + 2
+        kl_ramp = 1
+    else:
+        phase_0_end = max(1, int(total_steps * 0.01))
+        phase_1_end = max(phase_0_end + 1, int(total_steps * 0.10))
+        kl_ramp = max(1, int((total_steps - phase_1_end) * 0.05))
     lambda_sched = LambdaScheduler(
         total_steps=total_steps,
         phase_0_end=phase_0_end, phase_1_end=phase_1_end,
         lambda_anc_init=LAMBDA_ANC_INIT, lambda_anc_final=LAMBDA_ANC_FINAL,
         lambda_kl_final=LAMBDA_KL_FINAL, kl_ramp_steps=kl_ramp,
     )
-    print(f"Schedule: {lambda_sched}")
+    print(f"Schedule: {lambda_sched}"
+          + (" [frozen_hypernet = baseline #5 RQSplineFixed]" if frozen_hypernet else ""))
 
     ema = EMAWrapper(model.edain.hypernet, decay=EMA_DECAY)
     scaler = amp.GradScaler(enabled=torch.cuda.is_available())
@@ -1223,6 +1232,14 @@ def main():
              "small (~6.6K params) hypernet diverge on the first real epoch "
              "of phase 1; 10x lower LR brings it back to a stable regime.",
     )
+    parser.add_argument(
+        "--frozen_hypernet", action="store_true",
+        help="BASELINE #5 mode (blueprint section 6, RQSplineFixed). Forces "
+             "the hypernet to stay frozen for the entire training. The spline "
+             "is fixed at population Nyul (f_{theta_0}). Use this to obtain "
+             "the proper control for `v2 spline learning improves over a "
+             "fixed Nyul-spline preprocessing`. anc and KL losses stay at 0.",
+    )
     args = parser.parse_args()
 
     if args.num_patches is not None:
@@ -1305,16 +1322,19 @@ def main():
         fold_info = next(fo for fo in folds if fo["fold"] == args.fold)
         train_fold(fold_info, fp, device, smoke=args.smoke, max_epochs=args.epochs,
                    sw_batch_size=args.sw_batch_size,
-                   hypernet_lr_factor=args.hypernet_lr_factor)
+                   hypernet_lr_factor=args.hypernet_lr_factor,
+                   frozen_hypernet=args.frozen_hypernet)
     elif args.smoke:
         train_fold(folds[0], fp, device, smoke=True, max_epochs=args.epochs or 2,
                    sw_batch_size=args.sw_batch_size,
-                   hypernet_lr_factor=args.hypernet_lr_factor)
+                   hypernet_lr_factor=args.hypernet_lr_factor,
+                   frozen_hypernet=args.frozen_hypernet)
     else:
         for fold_info in folds:
             train_fold(fold_info, fp, device, max_epochs=args.epochs,
                        sw_batch_size=args.sw_batch_size,
-                       hypernet_lr_factor=args.hypernet_lr_factor)
+                       hypernet_lr_factor=args.hypernet_lr_factor,
+                       frozen_hypernet=args.frozen_hypernet)
 
     print("\n" + "=" * 70)
     print("DONE.")

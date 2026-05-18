@@ -97,6 +97,7 @@ python code/lipo_mri_edain_v2.py \
     --batch_size 1 \
     --num_patches 2 \
     --patch_size 256,224,32 \
-    --max_channels 320
+    --max_channels 320 \
+    --hypernet_lr_factor 0.1
 
 echo "End: $(date)"

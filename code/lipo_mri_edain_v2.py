@@ -708,7 +708,8 @@ def load_data_and_compute_fingerprint(data_dir: Path, split_json_path: Path,
 # =============================================================================
 
 def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = None,
-               artifact_path: Path = None, sw_batch_size: int = 1):
+               artifact_path: Path = None, sw_batch_size: int = 1,
+               hypernet_lr_factor: float = 0.1):
     CURR_FOLD = fold_info["fold"]
     target_pixdim = fp["target_pixdim"]
     patch_size = fp["patch_size"]
@@ -864,10 +865,24 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
                               n_subsample=20000).to(device)
     combined_loss = CombinedLoss(lambda_anc=LAMBDA_ANC_INIT, lambda_kl=0.0).to(device)
 
+    # Two param groups: backbone keeps the nnU-Net SGD-Nesterov-0.99 default,
+    # hypernet uses a smaller LR (blueprint section 5.2 fallback).  The
+    # hypernet is small (~6.6K params) and feeds non-linear softmax / softplus,
+    # so a momentum=0.99 amplification at lr=1e-2 blew up spline params at
+    # the phase 0 -> 1 transition in the first real Lipo fold run.
+    hypernet_params = list(model.edain.hypernet.parameters())
+    hypernet_id_set = {id(p) for p in hypernet_params}
+    backbone_params = [p for p in model.parameters() if id(p) not in hypernet_id_set]
+    hypernet_lr = BASE_LR * float(hypernet_lr_factor)
     optimizer = torch.optim.SGD(
-        model.parameters(),
-        lr=BASE_LR, momentum=0.99, nesterov=True, weight_decay=3e-5,
+        [
+            {"params": backbone_params, "lr": BASE_LR, "name": "backbone"},
+            {"params": hypernet_params, "lr": hypernet_lr, "name": "hypernet"},
+        ],
+        momentum=0.99, nesterov=True, weight_decay=3e-5,
     )
+    print(f"Optimizer: backbone lr={BASE_LR}, hypernet lr={hypernet_lr} "
+          f"(factor {hypernet_lr_factor})", flush=True)
 
     iter_per_epoch = max(1, len(fold_info["train_files"]) * NUM_PATCHES // BATCH_SIZE)
     total_steps = epochs_target * iter_per_epoch
@@ -953,11 +968,38 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
                 out = combined_loss(seg_loss, anchor_loss=anc_loss, kl_loss=kl_val)
                 loss = out.total
 
+            # Defensive: a single non-finite loss otherwise propagates NaN
+            # into the hypernet weights and the run is unrecoverable.
+            if not torch.isfinite(loss):
+                print(f"[warn] non-finite loss at step {global_step} "
+                      f"(seg={float(seg_loss):.4f} anc={float(anc_loss):.4f}); "
+                      f"skipping optimizer step", flush=True)
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()  # tell scaler the step was skipped
+                global_step += 1
+                continue
+
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(
                 model.edain.hypernet.parameters(), HYPERNET_GRAD_CLIP
             )
+
+            # One more guard: even with finite loss, gradients can be NaN
+            # (e.g. when AMP scales overflow). Skip the step in that case.
+            grad_finite = True
+            for p in hypernet_params:
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    grad_finite = False
+                    break
+            if not grad_finite:
+                print(f"[warn] non-finite hypernet grad at step {global_step}; "
+                      f"skipping optimizer step", flush=True)
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                global_step += 1
+                continue
+
             scaler.step(optimizer); scaler.update()
 
             if phase != 0:
@@ -981,7 +1023,10 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
 
         decay = poly_lr(epoch, epochs_target)
         for pg in optimizer.param_groups:
-            pg["lr"] = BASE_LR * decay
+            if pg.get("name") == "hypernet":
+                pg["lr"] = hypernet_lr * decay
+            else:
+                pg["lr"] = BASE_LR * decay
 
         if epoch % VAL_INTERVAL == 0 or epoch == epochs_target:
             model.eval()
@@ -1163,6 +1208,15 @@ def main():
              "2080Ti at patch (256, 224, 32) anything above 1 risks memory "
              "thrashing and an apparent hang.",
     )
+    parser.add_argument(
+        "--hypernet_lr_factor", type=float, default=0.1,
+        help="Hypernet LR as fraction of backbone LR (default 0.1; blueprint "
+             "section 5.2 fallback for instability observed at phase 0->1 "
+             "transition with the default 1e-2 nnU-Net LR). With momentum "
+             "0.99 the steady-state amplification 1/(1-0.99)=100 makes the "
+             "small (~6.6K params) hypernet diverge on the first real epoch "
+             "of phase 1; 10x lower LR brings it back to a stable regime.",
+    )
     args = parser.parse_args()
 
     if args.num_patches is not None:
@@ -1244,14 +1298,17 @@ def main():
     if args.fold is not None:
         fold_info = next(fo for fo in folds if fo["fold"] == args.fold)
         train_fold(fold_info, fp, device, smoke=args.smoke, max_epochs=args.epochs,
-                   sw_batch_size=args.sw_batch_size)
+                   sw_batch_size=args.sw_batch_size,
+                   hypernet_lr_factor=args.hypernet_lr_factor)
     elif args.smoke:
         train_fold(folds[0], fp, device, smoke=True, max_epochs=args.epochs or 2,
-                   sw_batch_size=args.sw_batch_size)
+                   sw_batch_size=args.sw_batch_size,
+                   hypernet_lr_factor=args.hypernet_lr_factor)
     else:
         for fold_info in folds:
             train_fold(fold_info, fp, device, max_epochs=args.epochs,
-                       sw_batch_size=args.sw_batch_size)
+                       sw_batch_size=args.sw_batch_size,
+                       hypernet_lr_factor=args.hypernet_lr_factor)
 
     print("\n" + "=" * 70)
     print("DONE.")

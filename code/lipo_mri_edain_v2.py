@@ -593,7 +593,8 @@ def build_folds_from_split_json(all_files, split_json_path: Path):
 def load_data_and_compute_fingerprint(data_dir: Path, split_json_path: Path,
                                       smoke: bool = False,
                                       patch_size_max: int = None,
-                                      max_channels: int = 512):
+                                      max_channels: int = 512,
+                                      explicit_patch_size: tuple = None):
     all_files = collect_lipo_files(data_dir)
     folds = build_folds_from_split_json(all_files, split_json_path)
 
@@ -625,7 +626,12 @@ def load_data_and_compute_fingerprint(data_dir: Path, split_json_path: Path,
     median_shape = np.median(np.array(resampled_shapes), axis=0).astype(int)
     target_pixdim = tuple(target_spacing.tolist())
 
-    if smoke:
+    if explicit_patch_size is not None:
+        # User passed an exact (X, Y, Z) patch -- bypass the auto heuristics.
+        # Useful for matching an nnU-Net plan exactly (e.g. for Lipo:
+        # plan patch is [32, 224, 256] in (Z, Y, X) -> (256, 224, 32) here).
+        patch_size = tuple(int(x) for x in explicit_patch_size)
+    elif smoke:
         patch_size = (64, 64, 64)
     elif anisotropic:
         patch_size = list((0, 0, 0))
@@ -637,8 +643,8 @@ def load_data_and_compute_fingerprint(data_dir: Path, split_json_path: Path,
     else:
         patch_size = tuple(int(min(s, 128)) for s in median_shape)
 
-    # User-supplied global cap (e.g. 128 for 2080Ti compatibility).
-    if patch_size_max is not None:
+    # User-supplied global cap (only meaningful when patch was auto-derived).
+    if patch_size_max is not None and explicit_patch_size is None:
         patch_size = tuple(int(min(ps, patch_size_max)) for ps in patch_size)
 
     channels = [32]; strides = []
@@ -1113,14 +1119,20 @@ def main():
     )
     parser.add_argument(
         "--patch_size_max", type=int, default=None,
-        help="Cap every patch spatial dim (e.g. 128 for 2080Ti 11GB). "
-             "Defaults to the auto-detected fingerprint (up to 192 for "
-             "anisotropic, 128 isotropic).",
+        help="Cap every auto-detected patch spatial dim. Ignored if "
+             "--patch_size is given.",
+    )
+    parser.add_argument(
+        "--patch_size", type=str, default=None,
+        help="Explicit patch as comma-separated 'X,Y,Z' in this code's axis "
+             "order. Overrides auto-fingerprint and --patch_size_max. "
+             "nnU-Net's plan for Lipo is [Z=32, Y=224, X=256] -> pass "
+             "'256,224,32'.",
     )
     parser.add_argument(
         "--max_channels", type=int, default=512,
-        help="Cap on DynUNet filter count per level (default 512). "
-             "Drop to 256 to shrink the network for small GPUs.",
+        help="Cap on DynUNet filter count per level (default 512; nnU-Net "
+             "uses 320 for Lipo).",
     )
     args = parser.parse_args()
 
@@ -1172,8 +1184,18 @@ def main():
     print(f"Output     : {OUT_DIR}")
     print(f"Artifacts  : {ARTIFACT_DIR}")
     print(f"Device     : GPU {args.gpu if torch.cuda.is_available() else 'N/A (CPU)'}")
+    explicit_patch = None
+    if args.patch_size is not None:
+        parts = [p.strip() for p in args.patch_size.split(",")]
+        if len(parts) != 3:
+            raise ValueError(
+                f"--patch_size must be 3 comma-separated ints (X,Y,Z), got {args.patch_size!r}"
+            )
+        explicit_patch = tuple(int(p) for p in parts)
+
     print(f"Smoke      : {args.smoke}  |  Epochs override: {args.epochs}")
     print(f"Batch={BATCH_SIZE}, NumPatches={NUM_PATCHES}, "
+          f"PatchSize={explicit_patch or 'auto'}, "
           f"PatchSizeMax={args.patch_size_max}, MaxChannels={args.max_channels}")
     print("=" * 70 + "\n")
 
@@ -1182,6 +1204,7 @@ def main():
         DATA_DIR, SPLIT_JSON, smoke=args.smoke,
         patch_size_max=args.patch_size_max,
         max_channels=args.max_channels,
+        explicit_patch_size=explicit_patch,
     )
     folds = fp["folds"]
 

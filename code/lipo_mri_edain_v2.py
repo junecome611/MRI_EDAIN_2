@@ -591,7 +591,9 @@ def build_folds_from_split_json(all_files, split_json_path: Path):
 
 
 def load_data_and_compute_fingerprint(data_dir: Path, split_json_path: Path,
-                                      smoke: bool = False):
+                                      smoke: bool = False,
+                                      patch_size_max: int = None,
+                                      max_channels: int = 512):
     all_files = collect_lipo_files(data_dir)
     folds = build_folds_from_split_json(all_files, split_json_path)
 
@@ -635,6 +637,10 @@ def load_data_and_compute_fingerprint(data_dir: Path, split_json_path: Path,
     else:
         patch_size = tuple(int(min(s, 128)) for s in median_shape)
 
+    # User-supplied global cap (e.g. 128 for 2080Ti compatibility).
+    if patch_size_max is not None:
+        patch_size = tuple(int(min(ps, patch_size_max)) for ps in patch_size)
+
     channels = [32]; strides = []
     current_shape = np.array(patch_size, dtype=np.int32)
     while True:
@@ -643,7 +649,7 @@ def load_data_and_compute_fingerprint(data_dir: Path, split_json_path: Path,
         if (np.ceil(current_shape / stride) < 4).any(): break
         strides.append(tuple(stride))
         current_shape = np.ceil(current_shape / stride)
-        channels.append(min(channels[-1] * 2, 512))
+        channels.append(min(channels[-1] * 2, max_channels))
     channels = tuple(channels)
 
     total_stride = np.array([1, 1, 1])
@@ -1095,6 +1101,17 @@ def main():
         "--batch_size", type=int, default=None,
         help=f"Train batch size (default {BATCH_SIZE}).",
     )
+    parser.add_argument(
+        "--patch_size_max", type=int, default=None,
+        help="Cap every patch spatial dim (e.g. 128 for 2080Ti 11GB). "
+             "Defaults to the auto-detected fingerprint (up to 192 for "
+             "anisotropic, 128 isotropic).",
+    )
+    parser.add_argument(
+        "--max_channels", type=int, default=512,
+        help="Cap on DynUNet filter count per level (default 512). "
+             "Drop to 256 to shrink the network for small GPUs.",
+    )
     args = parser.parse_args()
 
     if args.num_patches is not None:
@@ -1146,10 +1163,16 @@ def main():
     print(f"Artifacts  : {ARTIFACT_DIR}")
     print(f"Device     : GPU {args.gpu if torch.cuda.is_available() else 'N/A (CPU)'}")
     print(f"Smoke      : {args.smoke}  |  Epochs override: {args.epochs}")
+    print(f"Batch={BATCH_SIZE}, NumPatches={NUM_PATCHES}, "
+          f"PatchSizeMax={args.patch_size_max}, MaxChannels={args.max_channels}")
     print("=" * 70 + "\n")
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
-    fp = load_data_and_compute_fingerprint(DATA_DIR, SPLIT_JSON, smoke=args.smoke)
+    fp = load_data_and_compute_fingerprint(
+        DATA_DIR, SPLIT_JSON, smoke=args.smoke,
+        patch_size_max=args.patch_size_max,
+        max_channels=args.max_channels,
+    )
     folds = fp["folds"]
 
     print(f"Loaded {len(folds)} folds from {SPLIT_JSON.name}:")

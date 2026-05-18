@@ -10,7 +10,15 @@
 #SBATCH -e logs/slurm_%x_%j.err
 
 # ============================================================
-# Lipo MRI-EDAIN v2 -- fold 0, full 1000-epoch run.
+# Lipo MRI-EDAIN v2 -- fold 0, full 1000-epoch run, 2080Ti-sized.
+#
+# Memory budget (RTX 2080Ti, 11 GB):
+#   patch_size_max = 128  -> auto-detected patch capped at 128x128x48
+#                            (instead of default 192x192x48)
+#   max_channels   = 256  -> DynUNet caps filter count per level at 256
+#                            (instead of default 512)
+#   batch_size     = 1
+#   num_patches    = 2    -> 2 patches / forward step (vs 4 default)
 #
 # Pipeline: Load -> Orientation(RAS) -> Spacing
 #           -> CropForeground(Otsu) -> NormalizeIntensity(zscore on fg)
@@ -43,6 +51,16 @@ source ../myenv/bin/activate
 [[ -f ./lipo_split.json ]] || { echo "FATAL: lipo_split.json missing in $(pwd)"; exit 1; }
 [[ -d ../dataset/lipo  ]] || { echo "FATAL: ../dataset/lipo missing";              exit 1; }
 
+# Force-reset the precompute artifact if it was produced by an earlier version
+# that pre-dates the percentile-subsample fix (some Lipo cases would fail with
+# `quantile() input tensor is too large` and the standardizer would be fit on
+# the surviving subset only). With the fix in place we want a clean recompute.
+STALE_ARTIFACT="./outputs/lipo_mri_edain_v2/artifacts/fold_0.pt"
+if [[ -f "$STALE_ARTIFACT" ]]; then
+    echo "[init] removing stale precompute artifact $STALE_ARTIFACT"
+    rm -f "$STALE_ARTIFACT"
+fi
+
 export TORCH_COMPILE_DISABLE=1
 export TORCHDYNAMO_DISABLE=1
 # Help CUDA allocator handle fragmentation on smaller GPUs (e.g., 2080Ti 11GB).
@@ -52,8 +70,6 @@ export PYTHONPATH="$SLURM_SUBMIT_DIR"
 
 echo "Fold: 0 | Start: $(date)"
 
-# NOTE: num_patches reduced from 4 -> 2 for 2080Ti compatibility, matching v11.
-# Comment out --num_patches (or set 4) on A40 / similar to use default.
 python code/lipo_mri_edain_v2.py \
     --fold 0 \
     --gpu 0 \
@@ -61,7 +77,10 @@ python code/lipo_mri_edain_v2.py \
     --split_json ./lipo_split.json \
     --out_dir ./outputs/lipo_mri_edain_v2 \
     --epochs 1000 \
+    --seed 2025 \
+    --batch_size 1 \
     --num_patches 2 \
-    --seed 2025
+    --patch_size_max 128 \
+    --max_channels 256
 
 echo "End: $(date)"

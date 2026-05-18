@@ -14,12 +14,18 @@ import torch.nn as nn
 # Shah 2011 11-landmark percentile set (blueprint section 2.3, 3.2 PERCENTILES)
 PERCENTILES = (0.01, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.99)
 
+# torch.quantile has a hard 2**24 element limit; we subsample beyond this.
+# At >1M foreground voxels percentiles are already Monte-Carlo-tight to <1e-3,
+# so a sample down to 16M is statistically harmless for Nyul landmarks.
+_MAX_QUANTILE_INPUT = (1 << 24) - 1  # 16,777,215
+
 
 def percentile_summary(
     X: torch.Tensor,
     mask: torch.Tensor,
     percentiles: tuple = PERCENTILES,
     min_foreground_voxels: int = 100,
+    max_quantile_input: int = _MAX_QUANTILE_INPUT,
 ) -> torch.Tensor:
     """Compute the 11-d percentile vector on foreground voxels.
 
@@ -29,6 +35,9 @@ def percentile_summary(
         percentiles: tuple of percentile fractions in (0, 1).
         min_foreground_voxels: if foreground has fewer voxels than this, fall
             back to whole-volume percentiles (degenerate case guard, section 4.1).
+        max_quantile_input: cap for torch.quantile (default 2**24 - 1). Inputs
+            larger than this get random-sampled with replacement (cheap via
+            torch.randint).
 
     Returns:
         gamma_raw: tensor of length len(percentiles), detached.
@@ -41,6 +50,13 @@ def percentile_summary(
     foreground = X[mask.to(torch.bool)]
     if foreground.numel() < min_foreground_voxels:
         foreground = X.reshape(-1)
+
+    # Guard against torch.quantile's 2**24 element limit (e.g. large body MR
+    # after Otsu crop). Random sample with replacement keeps the call cheap.
+    if foreground.numel() > max_quantile_input:
+        N = foreground.numel()
+        idx = torch.randint(0, N, (max_quantile_input,), device=foreground.device)
+        foreground = foreground[idx]
 
     q = torch.as_tensor(percentiles, dtype=X.dtype, device=X.device)
     gamma_raw = torch.quantile(foreground.to(torch.float32), q.to(torch.float32))

@@ -498,7 +498,9 @@ def get_lr(optim):
 # Dataset fingerprint (same as v1)
 # =============================================================================
 
-def load_data_and_compute_fingerprint(smoke: bool = False):
+def load_data_and_compute_fingerprint(smoke: bool = False,
+                                      patch_size_max: int = None,
+                                      max_channels: int = 512):
     with open(SPLIT_JSON) as f:
         split_data = json.load(f)
 
@@ -555,6 +557,10 @@ def load_data_and_compute_fingerprint(smoke: bool = False):
     else:
         patch_size = tuple(int(min(s, 128)) for s in median_shape)
 
+    # User-supplied global cap (e.g. 128 for 2080Ti compatibility).
+    if patch_size_max is not None:
+        patch_size = tuple(int(min(ps, patch_size_max)) for ps in patch_size)
+
     channels = [32]; strides = []
     current_shape = np.array(patch_size, dtype=np.int32)
     while True:
@@ -563,7 +569,7 @@ def load_data_and_compute_fingerprint(smoke: bool = False):
         if (np.ceil(current_shape / stride) < 4).any(): break
         strides.append(tuple(stride))
         current_shape = np.ceil(current_shape / stride)
-        channels.append(min(channels[-1] * 2, 512))
+        channels.append(min(channels[-1] * 2, max_channels))
     channels = tuple(channels)
 
     total_stride = np.array([1, 1, 1])
@@ -1040,6 +1046,14 @@ def main():
         "--batch_size", type=int, default=None,
         help=f"Train batch size (default {BATCH_SIZE}).",
     )
+    parser.add_argument(
+        "--patch_size_max", type=int, default=None,
+        help="Cap every patch spatial dim (e.g. 128 for 2080Ti 11GB).",
+    )
+    parser.add_argument(
+        "--max_channels", type=int, default=512,
+        help="Cap on DynUNet filter count per level (default 512).",
+    )
     args = parser.parse_args()
 
     # Apply path overrides.
@@ -1084,7 +1098,11 @@ def main():
     print("=" * 70 + "\n")
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
-    fp = load_data_and_compute_fingerprint(smoke=args.smoke)
+    fp = load_data_and_compute_fingerprint(
+        smoke=args.smoke,
+        patch_size_max=args.patch_size_max,
+        max_channels=args.max_channels,
+    )
     folds = fp["folds"]
 
     if args.fold is not None:

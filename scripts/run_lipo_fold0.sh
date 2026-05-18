@@ -13,12 +13,20 @@
 # Lipo MRI-EDAIN v2 -- fold 0, full 1000-epoch run, 2080Ti-sized.
 #
 # Memory budget (RTX 2080Ti, 11 GB):
-#   patch_size_max = 128  -> auto-detected patch capped at 128x128x48
-#                            (instead of default 192x192x48)
+#   patch_size_max = 128  -> auto patch X/Y capped at 128 (vs 192 default).
+#                            Z falls out at 40 = floor(median_47 / stride_8) * 8
+#                            (was 48 = ceil pre-fix, which overshot median 47
+#                            and forced zero-padding for short-Z samples,
+#                            erasing tumor context).
 #   max_channels   = 256  -> DynUNet caps filter count per level at 256
-#                            (instead of default 512)
+#                            (nnU-Net's reference plan uses 320; default 512).
 #   batch_size     = 1
-#   num_patches    = 2    -> 2 patches / forward step (vs 4 default)
+#   num_patches    = 2    -> 2 patches / forward step (vs 4 default).
+#
+# Reference nnU-Net plan for this dataset:
+#   patch=[32,224,256] (ZYX) channels=[32,64,128,256,320,320].
+#   We trade some patch coverage on Y/X for memory; Z=40 still gives ~85%
+#   coverage of the median image while staying divisible by total stride 8.
 #
 # Pipeline: Load -> Orientation(RAS) -> Spacing
 #           -> CropForeground(Otsu) -> NormalizeIntensity(zscore on fg)

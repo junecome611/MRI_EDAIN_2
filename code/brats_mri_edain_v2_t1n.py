@@ -577,8 +577,15 @@ def load_data_and_compute_fingerprint(smoke: bool = False,
     patch_size_fixed = list(patch_size)
     for ax in range(3):
         if patch_size_fixed[ax] % total_stride[ax] != 0:
-            patch_size_fixed[ax] = int(
-                np.ceil(patch_size_fixed[ax] / total_stride[ax]) * total_stride[ax])
+            # FLOOR (not ceil): match nnU-Net's behaviour of staying at or
+            # below the median image size, especially on the anisotropic
+            # axis where ceil would overshoot the median and force zero-
+            # padding that erases tumor context for shorter samples.
+            patch_size_fixed[ax] = max(
+                int(total_stride[ax]),
+                int(np.floor(patch_size_fixed[ax] / total_stride[ax])
+                    * total_stride[ax]),
+            )
     patch_size = tuple(patch_size_fixed)
     oversized_patch = compute_oversized_patch(patch_size)
 

@@ -657,8 +657,18 @@ def load_data_and_compute_fingerprint(data_dir: Path, split_json_path: Path,
     patch_size_fixed = list(patch_size)
     for ax in range(3):
         if patch_size_fixed[ax] % total_stride[ax] != 0:
-            patch_size_fixed[ax] = int(
-                np.ceil(patch_size_fixed[ax] / total_stride[ax]) * total_stride[ax])
+            # FLOOR (not ceil) so we never overshoot the median image size on
+            # the anisotropic axis. nnU-Net plans confirm this: e.g. Lipo
+            # median Z=47, total_stride_Z=8 -> nnU-Net patch Z=32 (4*8) far
+            # below 47.  We previously used ceil here which gave Z=48 > 47,
+            # forcing SpatialPad to zero-fill many short-Z cases and erasing
+            # tumor context.  max(total_stride, floor) guards the degenerate
+            # case where median < total_stride.
+            patch_size_fixed[ax] = max(
+                int(total_stride[ax]),
+                int(np.floor(patch_size_fixed[ax] / total_stride[ax])
+                    * total_stride[ax]),
+            )
     patch_size = tuple(patch_size_fixed)
     oversized_patch = compute_oversized_patch(patch_size)
 

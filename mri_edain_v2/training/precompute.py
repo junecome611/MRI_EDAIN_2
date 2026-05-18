@@ -164,6 +164,7 @@ def precompute_fold_artifacts(
     per_case_preprocessor: Optional[Callable] = None,
     verbose: bool = True,
     max_cases: Optional[int] = None,
+    anchor_type: str = "population_nyul",
 ) -> PrecomputeArtifacts:
     """Run the offline precompute pipeline for one fold.
 
@@ -232,7 +233,7 @@ def precompute_fold_artifacts(
 
     # Fit theta_0.
     if verbose:
-        print(f"[precompute] fitting theta_0 (population Nyul) via L-BFGS ...")
+        print(f"[precompute] fitting theta_0 (anchor_type={anchor_type}) via L-BFGS ...")
     theta_0 = fit_population_nyul_theta_0(
         raw_gammas,
         K=K,
@@ -242,6 +243,7 @@ def precompute_fold_artifacts(
         percentiles=percentiles,
         warn_threshold_r0=-1.0,  # we report r_0 manually below
         verbose=verbose,
+        anchor_type=anchor_type,
     )
 
     # Sanity: compute final r_0.
@@ -250,8 +252,12 @@ def precompute_fold_artifacts(
     r_0 = compute_non_affineness(theta_0, K=K, B_supp=B_supp).item()
     if verbose:
         print(f"[precompute] theta_0 non-affineness r_0 = {r_0:.4f}")
-        if r_0 < 0.10:
-            print(f"  WARNING: r_0 < 0.10 -> population Nyul is near-affine "
+        if anchor_type == "population_nyul" and r_0 < 0.10:
+            # Only flag if population_nyul (where small r_0 means the data
+            # itself is too Gaussian for Nyul to do meaningful work).
+            # For anchor_type='identity', r_0 ~ 0 is the intended behaviour.
+            print(f"  WARNING: r_0 < 0.10 with population_nyul anchor "
+                  f"-> population Nyul is near-affine for this dataset "
                   f"(blueprint section 4.4 step 6: Plan B trigger).")
 
     population_landmarks = raw_gammas.mean(dim=0)
@@ -260,6 +266,7 @@ def precompute_fold_artifacts(
         "n_failed": str(n_failed),
         "foreground_method": foreground_method,
         "target_pixdim": "none" if target_pixdim is None else str(tuple(target_pixdim)),
+        "anchor_type": anchor_type,
         "r_0_non_affineness": f"{r_0:.6f}",
         "population_landmark_min": f"{population_landmarks.min().item():.4f}",
         "population_landmark_max": f"{population_landmarks.max().item():.4f}",

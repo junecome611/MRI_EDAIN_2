@@ -620,7 +620,7 @@ def load_data_and_compute_fingerprint(smoke: bool = False,
 
 def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = None,
                sw_batch_size: int = 1, hypernet_lr_factor: float = 0.1,
-               frozen_hypernet: bool = False,
+               frozen_hypernet: bool = False, anchor_type: str = "population_nyul",
                artifact_path: Path = None):
     CURR_FOLD = fold_info["fold"]
     target_pixdim = fp["target_pixdim"]
@@ -662,6 +662,7 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
             nyul_iters=200,
             verbose=True,
             max_cases=(5 if smoke else None),
+            anchor_type=anchor_type,
         )
         save_precomputed_artifacts(artifact, artifact_path)
         print(f"[precompute] saved -> {artifact_path}")
@@ -1147,6 +1148,13 @@ def main():
         help="BASELINE #5 mode: keep hypernet frozen for the full training. "
              "Spline = population Nyul. anc / KL stay at 0.",
     )
+    parser.add_argument(
+        "--anchor_type", type=str, default="population_nyul",
+        choices=["population_nyul", "identity"],
+        help="Anchor target for theta_0 (population_nyul | identity). "
+             "Use 'identity' on datasets where population_nyul develops "
+             "large local slopes that amplify noise.",
+    )
     args = parser.parse_args()
 
     # Apply path overrides.
@@ -1203,19 +1211,22 @@ def main():
         train_fold(fold_info, fp, device, smoke=args.smoke, max_epochs=args.epochs,
                    sw_batch_size=args.sw_batch_size,
                    hypernet_lr_factor=args.hypernet_lr_factor,
-                   frozen_hypernet=args.frozen_hypernet)
+                   frozen_hypernet=args.frozen_hypernet,
+                   anchor_type=args.anchor_type)
     elif args.smoke:
         # Smoke runs fold 0 only.
         train_fold(folds[0], fp, device, smoke=True, max_epochs=args.epochs or 2,
                    sw_batch_size=args.sw_batch_size,
                    hypernet_lr_factor=args.hypernet_lr_factor,
-                   frozen_hypernet=args.frozen_hypernet)
+                   frozen_hypernet=args.frozen_hypernet,
+                   anchor_type=args.anchor_type)
     else:
         for fold_info in folds:
             train_fold(fold_info, fp, device, max_epochs=args.epochs,
                        sw_batch_size=args.sw_batch_size,
                        hypernet_lr_factor=args.hypernet_lr_factor,
-                       frozen_hypernet=args.frozen_hypernet)
+                       frozen_hypernet=args.frozen_hypernet,
+                       anchor_type=args.anchor_type)
 
     print("\n" + "=" * 70)
     print("DONE.")

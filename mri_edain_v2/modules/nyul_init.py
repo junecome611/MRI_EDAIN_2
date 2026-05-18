@@ -131,20 +131,35 @@ def fit_population_nyul_theta_0(
     percentiles: tuple = PERCENTILES,
     warn_threshold_r0: float = 0.10,
     verbose: bool = False,
+    anchor_type: str = "population_nyul",
 ) -> torch.Tensor:
-    """Fit theta^(0) so that the RQ-spline approximates the population Nyul
-    piecewise-linear mapping.
+    """Fit theta^(0) given a choice of anchor target.
+
+    `anchor_type` options:
+      - "population_nyul" (blueprint default): the spline approximates the
+        piecewise-linear mapping that takes population landmarks to standard-
+        normal z-scores at the corresponding percentile positions. This is the
+        classical Nyul behaviour. WARNING on body MR datasets like Lipo:
+        if the source distribution is heavily peaked at the low end the
+        mapping develops huge local slopes (observed >30x for Lipo 1%->10%),
+        amplifying noise and harming tumour segmentation. Confirmed on Lipo
+        fold-0 (Val Dice plateaued at ~0.61 vs ~0.79 baseline).
+      - "identity": target(x) = x. f_{theta_0} is fit to the identity
+        function. The spline at init is essentially a no-op, the backbone
+        sees the upstream-z-scored input directly, and the hypernet learns
+        deviations driven by Dice/CE alone. r_0 is small by construction
+        (the only deviation from identity is the alpha_tail=0.5 boundary
+        slope vs identity slope 1). Safer default for new datasets.
 
     Args:
-        training_gammas: (N, 11) tensor of gamma_raw values across N training
-            scans. Expressed in whatever standardised intensity scale the spline
-            input will use at training time (typically per-volume z-scored).
-        K, B_supp: spline grid (see rq_spline_parameterize).
+        training_gammas: (N, 11) tensor of per-case 11-percentile gamma in
+            z-scored intensity scale.
+        K, B_supp: spline grid.
         n_iter, lr: L-BFGS max_iter and learning rate.
-        grid_size: number of points used for piecewise-linear -> spline fit.
-        percentiles: percentile fractions corresponding to training_gammas cols.
-        warn_threshold_r0: warn if final non-affineness r_0 is below this
-            value (blueprint section 4.4 step 6: Plan B trigger condition).
+        grid_size: number of grid points used for the fit.
+        percentiles: percentile fractions matching the gamma columns.
+        warn_threshold_r0: warn if final r_0 falls below this value.
+        anchor_type: "population_nyul" | "identity".
 
     Returns:
         theta_0 of shape (3K - 1,), detached.
@@ -154,6 +169,10 @@ def fit_population_nyul_theta_0(
             f"training_gammas must be (N, {len(percentiles)}), "
             f"got {tuple(training_gammas.shape)}"
         )
+    if anchor_type not in ("population_nyul", "identity"):
+        raise ValueError(
+            f"anchor_type must be 'population_nyul' or 'identity', got {anchor_type!r}"
+        )
 
     device = training_gammas.device
     dtype = torch.float32
@@ -161,9 +180,14 @@ def fit_population_nyul_theta_0(
     # 1. Population landmarks: mean across training scans per percentile slot.
     L = training_gammas.to(dtype).mean(dim=0)  # (11,)
 
-    # 2. Target standardised positions = Phi^{-1}(percentile) z-scores.
-    p = torch.as_tensor(percentiles, dtype=torch.float64, device=device).clamp(1e-6, 1 - 1e-6)
-    target = _inverse_normal_cdf(p).to(dtype)  # (11,)
+    # 2. Target positions (depend on anchor_type).
+    if anchor_type == "population_nyul":
+        # Map population landmarks -> standard normal z-scores at percentile.
+        p = torch.as_tensor(percentiles, dtype=torch.float64, device=device).clamp(1e-6, 1 - 1e-6)
+        target = _inverse_normal_cdf(p).to(dtype)  # (11,)
+    else:  # identity
+        # Target at each landmark x is x itself -> piecewise linear gives y=x.
+        target = L.clone()
 
     # Landmarks must be strictly increasing for piecewise-linear interp; if a
     # tiny tie sneaks in (degenerate training data), break it with a small eps.
@@ -175,6 +199,18 @@ def fit_population_nyul_theta_0(
     # 3-4. Dense grid + target piecewise-linear samples.
     grid = torch.linspace(-B_supp, B_supp, grid_size, device=device, dtype=dtype)
     target_on_grid = piecewise_linear_interp(grid, L, target)
+
+    # Only weight fit error within the landmark range. Outside that range the
+    # target is extrapolated by the first/last landmark segment slope, which
+    # for population_nyul on Lipo can be ~30x and produces absurd target
+    # values (e.g. -93 at grid=-4) that the bounded spline (linear tail with
+    # alpha_tail<<30) cannot match. Weighting those points dominates the loss
+    # and ruins the fit even in the interior.
+    fit_mask = (grid >= L[0]) & (grid <= L[-1])
+    # Always include at least the landmark range; if it's degenerate, fall
+    # back to the full grid to keep L-BFGS well-posed.
+    if fit_mask.sum() < 5:
+        fit_mask = torch.ones_like(grid, dtype=torch.bool)
 
     # 5. Optimise theta_0 via L-BFGS (one outer step with `n_iter` inner iters).
     theta_0 = torch.zeros(3 * K - 1, device=device, dtype=dtype, requires_grad=True)
@@ -192,13 +228,14 @@ def fit_population_nyul_theta_0(
         optim.zero_grad()
         params = rq_spline_parameterize(theta_0, K=K, B_supp=B_supp)
         f_out = rq_spline_apply(grid, params)
-        loss = (f_out - target_on_grid).pow(2).mean()
+        loss = ((f_out - target_on_grid) ** 2)[fit_mask].mean()
         loss.backward()
         return loss
 
     final_loss = optim.step(closure)
     if verbose:
-        print(f"[fit_population_nyul_theta_0] final loss = {float(final_loss):.6e}")
+        print(f"[fit_population_nyul_theta_0] anchor_type={anchor_type}, "
+              f"final loss (within landmark range) = {float(final_loss):.6e}")
 
     # 6. Verify non-affineness of theta_0 (blueprint section 4.4 step 6).
     r_0 = compute_non_affineness(theta_0.detach(), K=K, B_supp=B_supp).item()
@@ -249,6 +286,7 @@ class PopulationNyulInitializer:
         self,
         training_gammas: torch.Tensor,
         verbose: bool = False,
+        anchor_type: str = "population_nyul",
     ) -> torch.Tensor:
         return fit_population_nyul_theta_0(
             training_gammas,
@@ -260,4 +298,5 @@ class PopulationNyulInitializer:
             percentiles=self.percentiles,
             warn_threshold_r0=self.warn_threshold_r0,
             verbose=verbose,
+            anchor_type=anchor_type,
         )

@@ -709,7 +709,8 @@ def load_data_and_compute_fingerprint(data_dir: Path, split_json_path: Path,
 
 def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = None,
                artifact_path: Path = None, sw_batch_size: int = 1,
-               hypernet_lr_factor: float = 0.1, frozen_hypernet: bool = False):
+               hypernet_lr_factor: float = 0.1, frozen_hypernet: bool = False,
+               anchor_type: str = "population_nyul"):
     CURR_FOLD = fold_info["fold"]
     target_pixdim = fp["target_pixdim"]
     patch_size = fp["patch_size"]
@@ -751,6 +752,7 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
             per_case_preprocessor=lipo_per_case_preprocessor,
             verbose=True,
             max_cases=(5 if smoke else None),
+            anchor_type=anchor_type,
         )
         save_precomputed_artifacts(artifact, artifact_path)
         print(f"[precompute] saved -> {artifact_path}")
@@ -1240,6 +1242,18 @@ def main():
              "the proper control for `v2 spline learning improves over a "
              "fixed Nyul-spline preprocessing`. anc and KL losses stay at 0.",
     )
+    parser.add_argument(
+        "--anchor_type", type=str, default="population_nyul",
+        choices=["population_nyul", "identity"],
+        help="Anchor target for theta_0 fitting. 'population_nyul' (default) "
+             "maps population landmarks to standard-normal z-scores at "
+             "percentile positions. WARNING: on Lipo this produces a >30x "
+             "slope at the 1%%-10%% segment, amplifying dark-region noise "
+             "and harming tumour segmentation (Val Dice plateau ~0.61). "
+             "'identity' targets f(x)=x so the spline starts as a no-op; "
+             "phase 0 then reproduces the underlying z-score baseline. "
+             "Recommended for body-MR tumour segmentation.",
+    )
     args = parser.parse_args()
 
     if args.num_patches is not None:
@@ -1323,18 +1337,21 @@ def main():
         train_fold(fold_info, fp, device, smoke=args.smoke, max_epochs=args.epochs,
                    sw_batch_size=args.sw_batch_size,
                    hypernet_lr_factor=args.hypernet_lr_factor,
-                   frozen_hypernet=args.frozen_hypernet)
+                   frozen_hypernet=args.frozen_hypernet,
+                   anchor_type=args.anchor_type)
     elif args.smoke:
         train_fold(folds[0], fp, device, smoke=True, max_epochs=args.epochs or 2,
                    sw_batch_size=args.sw_batch_size,
                    hypernet_lr_factor=args.hypernet_lr_factor,
-                   frozen_hypernet=args.frozen_hypernet)
+                   frozen_hypernet=args.frozen_hypernet,
+                   anchor_type=args.anchor_type)
     else:
         for fold_info in folds:
             train_fold(fold_info, fp, device, max_epochs=args.epochs,
                        sw_batch_size=args.sw_batch_size,
                        hypernet_lr_factor=args.hypernet_lr_factor,
-                       frozen_hypernet=args.frozen_hypernet)
+                       frozen_hypernet=args.frozen_hypernet,
+                       anchor_type=args.anchor_type)
 
     print("\n" + "=" * 70)
     print("DONE.")

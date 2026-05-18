@@ -425,6 +425,48 @@ class RemapLabelsd(MapTransform):
         return d
 
 
+class ClipForegroundPercentiled(MapTransform):
+    """Per-volume foreground percentile clip (0.5%/99.5% by default, nnU-Net
+    standard). Mirrors the version in code/lipo_mri_edain_v2.py. Inserted
+    BEFORE NormalizeIntensityd in train/val MONAI Compose when
+    --outlier_clip=percentile is set."""
+
+    def __init__(self, keys, percentile_lo: float = 0.005,
+                 percentile_hi: float = 0.995, allow_missing_keys: bool = False):
+        super().__init__(keys, allow_missing_keys)
+        self.percentile_lo = float(percentile_lo)
+        self.percentile_hi = float(percentile_hi)
+
+    def __call__(self, data):
+        d = dict(data)
+        for key in self.key_iterator(d):
+            img = d[key]
+            was_tensor = torch.is_tensor(img)
+            orig_dtype = img.dtype if was_tensor else None
+            arr = (img.detach().cpu().numpy().astype(np.float32)
+                   if was_tensor else np.asarray(img, dtype=np.float32))
+            out = arr.copy()
+            if out.ndim == 4:
+                for c in range(out.shape[0]):
+                    fg = out[c][out[c] != 0]
+                    if fg.size >= 100:
+                        lo, hi = np.percentile(
+                            fg,
+                            [self.percentile_lo * 100, self.percentile_hi * 100],
+                        )
+                        out[c] = np.clip(out[c], lo, hi)
+            elif out.ndim == 3:
+                fg = out[out != 0]
+                if fg.size >= 100:
+                    lo, hi = np.percentile(
+                        fg,
+                        [self.percentile_lo * 100, self.percentile_hi * 100],
+                    )
+                    out = np.clip(out, lo, hi)
+            d[key] = torch.from_numpy(out).to(orig_dtype) if was_tensor else out
+        return d
+
+
 # =============================================================================
 # Model: DynUNet preceded by MRIEDAINLayer
 # =============================================================================
@@ -621,6 +663,7 @@ def load_data_and_compute_fingerprint(smoke: bool = False,
 def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = None,
                sw_batch_size: int = 1, hypernet_lr_factor: float = 0.1,
                frozen_hypernet: bool = False, anchor_type: str = "population_nyul",
+               outlier_clip: str = "none",
                artifact_path: Path = None):
     CURR_FOLD = fold_info["fold"]
     target_pixdim = fp["target_pixdim"]
@@ -663,6 +706,7 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
             verbose=True,
             max_cases=(5 if smoke else None),
             anchor_type=anchor_type,
+            outlier_clip=outlier_clip,
         )
         save_precomputed_artifacts(artifact, artifact_path)
         print(f"[precompute] saved -> {artifact_path}")
@@ -711,6 +755,12 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
     _rot_range = (-180, 180) if anisotropic else (-30, 30)
     _aniso_ax = anisotropy_axis if anisotropic else 2
 
+    clip_step = (
+        [ClipForegroundPercentiled(keys=["image"], percentile_lo=0.005,
+                                    percentile_hi=0.995)]
+        if outlier_clip == "percentile" else []
+    )
+
     train_transforms = Compose([
         LoadImaged(keys=["image", "label"]),
         EnsureChannelFirstd(keys=["image", "label"]),
@@ -720,6 +770,7 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
         RemapLabelsd(keys=["label"]),
         CropForegroundd(keys=["image", "label"], source_key="image",
                         select_fn=lambda x: x > 0, margin=5),
+        *clip_step,
         # Per-volume z-score on foreground -> spline input is in roughly [-3, 3].
         NormalizeIntensityd(keys=["image"], nonzero=True),
         SpatialPadd(keys=["image", "label"], spatial_size=oversized_patch),
@@ -753,6 +804,7 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
         RemapLabelsd(keys=["label"]),
         CropForegroundd(keys=["image", "label"], source_key="image",
                         select_fn=lambda x: x > 0, margin=5),
+        *clip_step,
         NormalizeIntensityd(keys=["image"], nonzero=True),
         SpatialPadd(keys=["image", "label"], spatial_size=patch_size),
         ToTensord(keys=["image", "label"]),
@@ -1155,6 +1207,12 @@ def main():
              "Use 'identity' on datasets where population_nyul develops "
              "large local slopes that amplify noise.",
     )
+    parser.add_argument(
+        "--outlier_clip", type=str, default="none",
+        choices=["none", "percentile"],
+        help="Per-volume foreground outlier handling before z-score "
+             "(none | percentile -> 0.5%%/99.5%%, nnU-Net default).",
+    )
     args = parser.parse_args()
 
     # Apply path overrides.
@@ -1206,27 +1264,25 @@ def main():
     )
     folds = fp["folds"]
 
+    common_kwargs = dict(
+        sw_batch_size=args.sw_batch_size,
+        hypernet_lr_factor=args.hypernet_lr_factor,
+        frozen_hypernet=args.frozen_hypernet,
+        anchor_type=args.anchor_type,
+        outlier_clip=args.outlier_clip,
+    )
+
     if args.fold is not None:
         fold_info = next(fo for fo in folds if fo["fold"] == args.fold)
         train_fold(fold_info, fp, device, smoke=args.smoke, max_epochs=args.epochs,
-                   sw_batch_size=args.sw_batch_size,
-                   hypernet_lr_factor=args.hypernet_lr_factor,
-                   frozen_hypernet=args.frozen_hypernet,
-                   anchor_type=args.anchor_type)
+                   **common_kwargs)
     elif args.smoke:
-        # Smoke runs fold 0 only.
         train_fold(folds[0], fp, device, smoke=True, max_epochs=args.epochs or 2,
-                   sw_batch_size=args.sw_batch_size,
-                   hypernet_lr_factor=args.hypernet_lr_factor,
-                   frozen_hypernet=args.frozen_hypernet,
-                   anchor_type=args.anchor_type)
+                   **common_kwargs)
     else:
         for fold_info in folds:
             train_fold(fold_info, fp, device, max_epochs=args.epochs,
-                       sw_batch_size=args.sw_batch_size,
-                       hypernet_lr_factor=args.hypernet_lr_factor,
-                       frozen_hypernet=args.frozen_hypernet,
-                       anchor_type=args.anchor_type)
+                       **common_kwargs)
 
     print("\n" + "=" * 70)
     print("DONE.")

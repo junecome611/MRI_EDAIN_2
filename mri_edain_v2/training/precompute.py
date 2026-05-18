@@ -91,6 +91,48 @@ def load_precomputed_artifacts(path: Union[str, Path]) -> PrecomputeArtifacts:
 
 
 # ---------------------------------------------------------------------------
+# Optional outlier clip transform (inline definition so this module has no
+# dependency on a training entry script). Mirrors the implementation in
+# code/lipo_mri_edain_v2.py:ClipForegroundPercentile so semantics match.
+# ---------------------------------------------------------------------------
+
+class _DefaultClipForegroundPercentile:
+    """Non-dict transform that clips foreground (nonzero) voxels of a single
+    array to [percentile_lo, percentile_hi]. Used inside the default precompute
+    Compose when outlier_clip=='percentile'.
+    """
+
+    def __init__(self, percentile_lo: float = 0.005, percentile_hi: float = 0.995):
+        self.percentile_lo = float(percentile_lo)
+        self.percentile_hi = float(percentile_hi)
+
+    def __call__(self, img):
+        was_tensor = torch.is_tensor(img)
+        orig_dtype = img.dtype if was_tensor else None
+        arr = (img.detach().cpu().numpy().astype(np.float32)
+               if was_tensor else np.asarray(img, dtype=np.float32))
+        out = arr.copy()
+        if out.ndim == 4:
+            for c in range(out.shape[0]):
+                fg = out[c][out[c] != 0]
+                if fg.size >= 100:
+                    lo, hi = np.percentile(
+                        fg, [self.percentile_lo * 100, self.percentile_hi * 100]
+                    )
+                    out[c] = np.clip(out[c], lo, hi)
+        elif out.ndim == 3:
+            fg = out[out != 0]
+            if fg.size >= 100:
+                lo, hi = np.percentile(
+                    fg, [self.percentile_lo * 100, self.percentile_hi * 100]
+                )
+                out = np.clip(out, lo, hi)
+        if was_tensor:
+            return torch.from_numpy(out).to(orig_dtype)
+        return out
+
+
+# ---------------------------------------------------------------------------
 # Default per-case preprocessor: matches what the trainer does upstream of
 # the spline. Users can pass in a custom one if their pipeline differs.
 # ---------------------------------------------------------------------------
@@ -99,17 +141,20 @@ def default_per_case_preprocessor(
     image_path: str,
     target_pixdim: Optional[Tuple[float, float, float]] = None,
     foreground_method: str = "nonzero",
+    outlier_clip: str = "none",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply the trainer's upstream pipeline to a single case and return
     (X_zscored, mask) ready for percentile_summary.
 
     Mirrors the MONAI Compose used by the trainer:
         LoadImage -> EnsureChannelFirst -> Orientation(RAS) -> Spacing
-        -> CropForeground(>0) -> NormalizeIntensity(nonzero=True)
+        -> CropForeground(>0) -> [opt clip 0.5/99.5 percentile]
+        -> NormalizeIntensity(nonzero=True)
 
-    Foreground mask after NormalizeIntensity is `(X != 0)`: NormalizeIntensity
-    with nonzero=True z-scores only the non-zero voxels and leaves zeros
-    untouched, so background remains 0 for BraTS skull-stripped data.
+    `outlier_clip="percentile"` applies a per-volume [0.5%, 99.5%] foreground
+    clip before z-score (nnU-Net default; recommended on body MR datasets
+    where bright outliers inflate std and distort the post-z-score
+    distribution).
     """
     from monai.transforms import (
         Compose,
@@ -129,6 +174,8 @@ def default_per_case_preprocessor(
     if target_pixdim is not None:
         steps.append(Spacing(pixdim=target_pixdim, mode="bilinear"))
     steps.append(CropForeground(select_fn=lambda x: x > 0, margin=5))
+    if outlier_clip == "percentile":
+        steps.append(_DefaultClipForegroundPercentile(0.005, 0.995))
     steps.append(NormalizeIntensity(nonzero=True))
 
     pipeline = Compose(steps)
@@ -165,6 +212,7 @@ def precompute_fold_artifacts(
     verbose: bool = True,
     max_cases: Optional[int] = None,
     anchor_type: str = "population_nyul",
+    outlier_clip: str = "none",
 ) -> PrecomputeArtifacts:
     """Run the offline precompute pipeline for one fold.
 
@@ -184,7 +232,16 @@ def precompute_fold_artifacts(
     Returns:
         PrecomputeArtifacts containing fit statistics.
     """
-    preprocessor = per_case_preprocessor or default_per_case_preprocessor
+    if per_case_preprocessor is None:
+        # Use default; pass outlier_clip via functools.partial so the loop
+        # below can still call the preprocessor with 3 positional args only.
+        from functools import partial
+        preprocessor = partial(default_per_case_preprocessor,
+                               outlier_clip=outlier_clip)
+    else:
+        # Custom preprocessor: caller is responsible for wiring outlier_clip
+        # (e.g. Lipo trainer uses functools.partial on its own preprocessor).
+        preprocessor = per_case_preprocessor
 
     cases_to_use = train_cases[:max_cases] if max_cases else train_cases
     N = len(cases_to_use)

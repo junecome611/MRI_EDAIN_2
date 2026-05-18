@@ -87,6 +87,7 @@ python code/lipo_mri_edain_v2.py \
     --patch_size 256,224,32 \
     --max_channels 320 \
     --frozen_hypernet \
-    --anchor_type identity
+    --anchor_type identity \
+    --outlier_clip percentile
 
 echo "End: $(date)"

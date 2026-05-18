@@ -147,6 +147,83 @@ def otsu_select_fn(x):
 
 
 # =============================================================================
+# Outlier clipping (per-volume foreground percentile clip).
+#
+# Lipo body MR has substantial bright outliers (motion / fat-saturation
+# artifacts) that inflate per-volume std by ~4x and compress the body-voxel
+# z-score distribution to a narrow range, in turn making the population-Nyul
+# spline anchor develop ~30x slopes in dense low-intensity bins -- amplifying
+# noise and crushing tumour contrast. Clipping foreground voxels to
+# [0.5%, 99.5%] percentile range before z-score normalisation is nnU-Net's
+# CT/MR default; we adopt the same.
+# =============================================================================
+
+def _clip_foreground_pcent_np(arr: np.ndarray, plo: float, phi: float) -> np.ndarray:
+    """Per-channel percentile clip on a numpy array. Shape (C, D, H, W) or
+    (D, H, W). plo, phi in (0, 1). Foreground = nonzero voxels per channel.
+    """
+    out = arr.copy()
+    if out.ndim == 4:
+        for c in range(out.shape[0]):
+            fg = out[c][out[c] != 0]
+            if fg.size >= 100:
+                lo, hi = np.percentile(fg, [plo * 100, phi * 100])
+                out[c] = np.clip(out[c], lo, hi)
+    elif out.ndim == 3:
+        fg = out[out != 0]
+        if fg.size >= 100:
+            lo, hi = np.percentile(out[out != 0], [plo * 100, phi * 100])
+            out = np.clip(out, lo, hi)
+    return out
+
+
+class ClipForegroundPercentile:
+    """Single-array transform: clip foreground (nonzero) voxels per-volume
+    to [percentile_lo, percentile_hi] percentile range. For use INSIDE the
+    precompute Compose pipeline."""
+
+    def __init__(self, percentile_lo: float = 0.005, percentile_hi: float = 0.995):
+        self.percentile_lo = float(percentile_lo)
+        self.percentile_hi = float(percentile_hi)
+
+    def __call__(self, img):
+        was_tensor = torch.is_tensor(img)
+        orig_dtype = img.dtype if was_tensor else None
+        if was_tensor:
+            img_np = img.detach().cpu().numpy().astype(np.float32)
+        else:
+            img_np = np.asarray(img, dtype=np.float32)
+        result = _clip_foreground_pcent_np(img_np, self.percentile_lo, self.percentile_hi)
+        if was_tensor:
+            return torch.from_numpy(result).to(orig_dtype)
+        return result
+
+
+class ClipForegroundPercentiled(MapTransform):
+    """Dict version of ClipForegroundPercentile for use in training Compose."""
+
+    def __init__(self, keys, percentile_lo: float = 0.005,
+                 percentile_hi: float = 0.995, allow_missing_keys: bool = False):
+        super().__init__(keys, allow_missing_keys)
+        self.percentile_lo = float(percentile_lo)
+        self.percentile_hi = float(percentile_hi)
+
+    def __call__(self, data):
+        d = dict(data)
+        for key in self.key_iterator(d):
+            img = d[key]
+            was_tensor = torch.is_tensor(img)
+            orig_dtype = img.dtype if was_tensor else None
+            if was_tensor:
+                img_np = img.detach().cpu().numpy().astype(np.float32)
+            else:
+                img_np = np.asarray(img, dtype=np.float32)
+            result = _clip_foreground_pcent_np(img_np, self.percentile_lo, self.percentile_hi)
+            d[key] = torch.from_numpy(result).to(orig_dtype) if was_tensor else result
+        return d
+
+
+# =============================================================================
 # Lipo-specific per-case preprocessor for the precompute pipeline.
 # (default_per_case_preprocessor assumes nonzero background.)
 # =============================================================================
@@ -155,9 +232,19 @@ def lipo_per_case_preprocessor(
     image_path: str,
     target_pixdim,
     foreground_method: str = "nonzero",  # ignored; we always Otsu
+    outlier_clip: str = "none",
 ):
-    """Apply Lipo training pipeline (Otsu crop + per-volume z-score) and
-    return (X_zscored, mask). Background is identified post-zscore as `X != 0`.
+    """Apply Lipo training pipeline and return (X_zscored, mask).
+
+    Steps:
+        LoadImage -> EnsureChannelFirst -> Orientation(RAS) -> Spacing
+        -> CropForeground(Otsu, margin=10)
+        -> [optional] ClipForegroundPercentile(0.005, 0.995)
+        -> NormalizeIntensity(nonzero=True)
+
+    `outlier_clip` options:
+        "none"        : no clipping (legacy default).
+        "percentile"  : nnU-Net-style 0.5%/99.5% per-volume foreground clip.
     """
     from monai.transforms import (
         Compose,
@@ -177,6 +264,8 @@ def lipo_per_case_preprocessor(
     if target_pixdim is not None:
         steps.append(Spacing(pixdim=target_pixdim, mode="bilinear"))
     steps.append(CropForeground(select_fn=otsu_select_fn, margin=10))
+    if outlier_clip == "percentile":
+        steps.append(ClipForegroundPercentile(0.005, 0.995))
     steps.append(NormalizeIntensity(nonzero=True))
 
     pipeline = Compose(steps)
@@ -710,7 +799,7 @@ def load_data_and_compute_fingerprint(data_dir: Path, split_json_path: Path,
 def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = None,
                artifact_path: Path = None, sw_batch_size: int = 1,
                hypernet_lr_factor: float = 0.1, frozen_hypernet: bool = False,
-               anchor_type: str = "population_nyul"):
+               anchor_type: str = "population_nyul", outlier_clip: str = "none"):
     CURR_FOLD = fold_info["fold"]
     target_pixdim = fp["target_pixdim"]
     patch_size = fp["patch_size"]
@@ -741,7 +830,13 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
         artifact = load_precomputed_artifacts(artifact_path)
     else:
         print(f"[precompute] running precompute "
-              f"on {len(fold_info['train_files'])} cases (Otsu foreground)")
+              f"on {len(fold_info['train_files'])} cases "
+              f"(Otsu foreground, outlier_clip={outlier_clip})")
+        # Bind outlier_clip into the preprocessor via functools.partial so the
+        # generic precompute loop (which only passes the first 3 positional
+        # args) still works.
+        from functools import partial
+        preprocessor = partial(lipo_per_case_preprocessor, outlier_clip=outlier_clip)
         artifact = precompute_fold_artifacts(
             fold_info["train_files"],
             target_pixdim=target_pixdim,
@@ -749,7 +844,7 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
             K=K_KNOTS,
             B_supp=B_SUPP,
             nyul_iters=200,
-            per_case_preprocessor=lipo_per_case_preprocessor,
+            per_case_preprocessor=preprocessor,
             verbose=True,
             max_cases=(5 if smoke else None),
             anchor_type=anchor_type,
@@ -795,6 +890,15 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
     _rot_range = (-180, 180) if anisotropic else (-30, 30)
     _aniso_ax = anisotropy_axis if anisotropic else 2
 
+    # Optional outlier clip step (between CropForeground and NormalizeIntensity)
+    # MUST appear in both train and val pipelines so train and inference see
+    # the same intensity distribution.
+    clip_step = (
+        [ClipForegroundPercentiled(keys=["image"], percentile_lo=0.005,
+                                    percentile_hi=0.995)]
+        if outlier_clip == "percentile" else []
+    )
+
     train_transforms = Compose([
         LoadImaged(keys=["image", "label"]),
         EnsureChannelFirstd(keys=["image", "label"]),
@@ -804,6 +908,7 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
         RemapLabelsd(keys=["label"]),
         CropForegroundd(keys=["image", "label"], source_key="image",
                         select_fn=otsu_select_fn, margin=10),
+        *clip_step,
         NormalizeIntensityd(keys=["image"], nonzero=True),
         SpatialPadd(keys=["image", "label"], spatial_size=oversized_patch),
         RandCropByPosNegLabeld(keys=["image", "label"], label_key="label",
@@ -836,6 +941,7 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
         RemapLabelsd(keys=["label"]),
         CropForegroundd(keys=["image", "label"], source_key="image",
                         select_fn=otsu_select_fn, margin=10),
+        *clip_step,
         NormalizeIntensityd(keys=["image"], nonzero=True),
         SpatialPadd(keys=["image", "label"], spatial_size=patch_size),
         ToTensord(keys=["image", "label"]),
@@ -1254,6 +1360,18 @@ def main():
              "phase 0 then reproduces the underlying z-score baseline. "
              "Recommended for body-MR tumour segmentation.",
     )
+    parser.add_argument(
+        "--outlier_clip", type=str, default="none",
+        choices=["none", "percentile"],
+        help="Per-volume foreground outlier handling done BEFORE z-score "
+             "normalization. 'none' (legacy default): no clipping. "
+             "'percentile': clip foreground (nonzero) voxels to the "
+             "[0.5%%, 99.5%%] percentile range per volume (nnU-Net default). "
+             "Strongly recommended for body MR (Lipo): unclipped, bright "
+             "outliers inflate per-volume std ~4x, compressing the body-voxel "
+             "post-z-score distribution and forcing the population_nyul "
+             "anchor to develop noise-amplifying ~30x slopes.",
+    )
     args = parser.parse_args()
 
     if args.num_patches is not None:
@@ -1332,26 +1450,25 @@ def main():
     for fo in folds:
         print(f"  Fold {fo['fold']}: train={len(fo['train_files'])} val={len(fo['val_files'])}")
 
+    common_kwargs = dict(
+        sw_batch_size=args.sw_batch_size,
+        hypernet_lr_factor=args.hypernet_lr_factor,
+        frozen_hypernet=args.frozen_hypernet,
+        anchor_type=args.anchor_type,
+        outlier_clip=args.outlier_clip,
+    )
+
     if args.fold is not None:
         fold_info = next(fo for fo in folds if fo["fold"] == args.fold)
         train_fold(fold_info, fp, device, smoke=args.smoke, max_epochs=args.epochs,
-                   sw_batch_size=args.sw_batch_size,
-                   hypernet_lr_factor=args.hypernet_lr_factor,
-                   frozen_hypernet=args.frozen_hypernet,
-                   anchor_type=args.anchor_type)
+                   **common_kwargs)
     elif args.smoke:
         train_fold(folds[0], fp, device, smoke=True, max_epochs=args.epochs or 2,
-                   sw_batch_size=args.sw_batch_size,
-                   hypernet_lr_factor=args.hypernet_lr_factor,
-                   frozen_hypernet=args.frozen_hypernet,
-                   anchor_type=args.anchor_type)
+                   **common_kwargs)
     else:
         for fold_info in folds:
             train_fold(fold_info, fp, device, max_epochs=args.epochs,
-                       sw_batch_size=args.sw_batch_size,
-                       hypernet_lr_factor=args.hypernet_lr_factor,
-                       frozen_hypernet=args.frozen_hypernet,
-                       anchor_type=args.anchor_type)
+                       **common_kwargs)
 
     print("\n" + "=" * 70)
     print("DONE.")

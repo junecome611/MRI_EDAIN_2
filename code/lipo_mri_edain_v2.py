@@ -968,14 +968,17 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
                 out = combined_loss(seg_loss, anchor_loss=anc_loss, kl_loss=kl_val)
                 loss = out.total
 
-            # Defensive: a single non-finite loss otherwise propagates NaN
-            # into the hypernet weights and the run is unrecoverable.
+            # NaN guard #1 (pre-backward): if loss is already non-finite, skip
+            # everything. We must NOT call scaler.update() here because no
+            # scaler.scale() was ever called for this step -- GradScaler's
+            # state machine asserts that found_inf has been recorded before
+            # update, and we have nothing to record. The scale factor simply
+            # stays the same and the next step proceeds normally.
             if not torch.isfinite(loss):
                 print(f"[warn] non-finite loss at step {global_step} "
                       f"(seg={float(seg_loss):.4f} anc={float(anc_loss):.4f}); "
                       f"skipping optimizer step", flush=True)
                 optimizer.zero_grad(set_to_none=True)
-                scaler.update()  # tell scaler the step was skipped
                 global_step += 1
                 continue
 
@@ -985,8 +988,11 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
                 model.edain.hypernet.parameters(), HYPERNET_GRAD_CLIP
             )
 
-            # One more guard: even with finite loss, gradients can be NaN
-            # (e.g. when AMP scales overflow). Skip the step in that case.
+            # NaN guard #2 (post-backward): even with finite loss, AMP can
+            # produce inf/NaN gradients (overflow during unscale). Here
+            # scaler.unscale_ has been called, so the inf check IS recorded;
+            # scaler.update() is therefore valid -- it will simply lower the
+            # scale factor for the next step.
             grad_finite = True
             for p in hypernet_params:
                 if p.grad is not None and not torch.isfinite(p.grad).all():

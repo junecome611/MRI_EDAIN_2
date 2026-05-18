@@ -66,6 +66,8 @@ def rq_spline_parameterize(
     B_supp: float = 4.0,
     alpha_tail: float = 0.5,
     min_derivative: float = 1e-3,
+    min_bin_width: float = 1e-3,
+    min_bin_height: float = 1e-3,
 ) -> SplineParams:
     """Convert raw (3K-1)-dim logits into monotone-enforced spline parameters.
 
@@ -77,6 +79,12 @@ def rq_spline_parameterize(
     Args:
         theta_logits: shape (..., 3K - 1).
         K, B_supp, alpha_tail, min_derivative: see blueprint section 2.5.
+        min_bin_width, min_bin_height: minimum fraction of the support that
+            each bin must occupy (Durkan 2019 default 1e-3, mirrors the
+            reference neural-spline-flows code). Without this floor, softmax
+            can concentrate mass on a single bin, leaving other bins with
+            near-zero width; rq_spline_apply then divides by ~0 and produces
+            NaN. This was observed at step 2088 of Lipo fold-0 phase 1.
 
     Returns:
         SplineParams with knot_x/knot_y/derivs same leading dims as theta_logits.
@@ -92,9 +100,13 @@ def rq_spline_parameterize(
     theta_h = theta_logits[..., K:2 * K]
     theta_d = theta_logits[..., 2 * K:]  # (..., K-1)
 
-    # Widths and heights via softmax * 2B (sum = 2B exactly).
-    widths = 2.0 * B_supp * torch.softmax(theta_w, dim=-1)
-    heights = 2.0 * B_supp * torch.softmax(theta_h, dim=-1)
+    # Widths and heights via softmax * 2B, but each bin reserved a minimum
+    # fraction `min_bin_*` of the total support. The remaining (1 - K * min_*)
+    # fraction is distributed by softmax. Both sums still equal 2B exactly.
+    w_softmax = torch.softmax(theta_w, dim=-1)
+    h_softmax = torch.softmax(theta_h, dim=-1)
+    widths = (min_bin_width + (1.0 - min_bin_width * K) * w_softmax) * 2.0 * B_supp
+    heights = (min_bin_height + (1.0 - min_bin_height * K) * h_softmax) * 2.0 * B_supp
 
     # Internal derivatives via softplus + min floor (positive).
     internal_d = F.softplus(theta_d) + min_derivative  # (..., K-1)

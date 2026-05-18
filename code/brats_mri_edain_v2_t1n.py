@@ -904,13 +904,13 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
                 out = combined_loss(seg_loss, anchor_loss=anc_loss, kl_loss=kl_val)
                 loss = out.total
 
-            # NaN guard #1: skip the step if loss is non-finite, else the
-            # NaN propagates into hypernet weights and the run is dead.
+            # NaN guard #1 (pre-backward): no scaler.scale() called yet, so
+            # do NOT call scaler.update() -- it would assert "no inf checks
+            # recorded prior to update".
             if not torch.isfinite(loss):
                 print(f"[warn] non-finite loss at step {global_step}; "
                       f"skipping optimizer step", flush=True)
                 optimizer.zero_grad(set_to_none=True)
-                scaler.update()
                 global_step += 1
                 continue
 
@@ -921,8 +921,8 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
                 model.edain.hypernet.parameters(), HYPERNET_GRAD_CLIP
             )
 
-            # NaN guard #2: AMP can occasionally produce inf/NaN grads even
-            # for finite loss.  Skip the step in that case as well.
+            # NaN guard #2 (post-backward): scaler.unscale_ was called above
+            # so found_inf is recorded -- scaler.update() is valid here.
             grad_finite = True
             for p in hypernet_params:
                 if p.grad is not None and not torch.isfinite(p.grad).all():

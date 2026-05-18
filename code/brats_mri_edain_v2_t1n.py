@@ -619,6 +619,7 @@ def load_data_and_compute_fingerprint(smoke: bool = False,
 # =============================================================================
 
 def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = None,
+               sw_batch_size: int = 1,
                artifact_path: Path = None):
     CURR_FOLD = fold_info["fold"]
     target_pixdim = fp["target_pixdim"]
@@ -838,6 +839,8 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
         train_loss_accum = 0.0
         train_seg_accum = 0.0; train_anc_accum = 0.0; train_kl_accum = 0.0
         train_dice_accum = 0.0; num_batches = 0
+        print(f"[ep {epoch}] training (phase={lambda_sched.phase(global_step)}, "
+              f"~{iter_per_epoch} steps) ...", flush=True)
 
         for batch in train_loader:
             images = batch["image"].to(device).float()
@@ -924,10 +927,14 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
         if epoch % VAL_INTERVAL == 0 or epoch == epochs_target:
             model.eval()
             dice_scores = []; val_loss_list = []; r_values = []
+            n_val = len(val_loader)
+            print(f"[val] starting epoch {epoch} validation ({n_val} cases, "
+                  f"sw_batch_size={sw_batch_size}) ...", flush=True)
+            t_val = time.time()
             with torch.inference_mode(), \
                  amp.autocast(device_type="cuda", enabled=torch.cuda.is_available()), \
                  ema.swap_in(model.edain.hypernet):
-                for val_data in val_loader:
+                for v_i, val_data in enumerate(val_loader):
                     val_images = val_data["image"].to(device).float()
                     val_labels = val_data["label"].to(device).long()
 
@@ -946,13 +953,15 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
                         return out
 
                     val_logits = sliding_window_inference(
-                        inputs=val_images, roi_size=patch_size, sw_batch_size=4,
+                        inputs=val_images, roi_size=patch_size,
+                        sw_batch_size=sw_batch_size,
                         predictor=predictor, overlap=0.5, mode="gaussian")
                     if isinstance(val_logits, (list, tuple)): val_logits = val_logits[0]
                     val_loss_list.append(seg_loss_fn(val_logits, val_labels).item())
                     post = KeepLargestConnectedComponent(applied_labels=[1])
                     val_pred = post(val_logits.argmax(dim=1, keepdim=True))
-                    dice_scores.append(float(_dice_from_labels(val_pred, val_labels).item()))
+                    case_dice = float(_dice_from_labels(val_pred, val_labels).item())
+                    dice_scores.append(case_dice)
 
                     # Phase-I diagnostic: non-affineness r_i for this case.
                     gamma_std_vol = standardizer(gamma_vol.unsqueeze(0))
@@ -960,6 +969,17 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
                     theta_vol = model.edain.theta_0 + delta_vol  # (1, 3K-1)
                     r = compute_non_affineness(theta_vol, K=K_KNOTS, B_supp=B_SUPP)
                     r_values.append(float(r.item()))
+
+                    del val_logits, val_pred, val_images, val_labels
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    if (v_i + 1) % 5 == 0 or v_i == n_val - 1:
+                        avg = float(np.mean(dice_scores))
+                        elapsed_val = time.time() - t_val
+                        print(f"[val]   {v_i+1}/{n_val} | last_dice={case_dice:.4f} "
+                              f"| running_avg={avg:.4f} | {elapsed_val:.1f}s",
+                              flush=True)
 
             val_dice_epoch = float(np.mean(dice_scores))
             val_loss_epoch = float(np.mean(val_loss_list))
@@ -994,7 +1014,7 @@ def train_fold(fold_info, fp, device, *, smoke: bool = False, max_epochs: int = 
             log_str += (f" | Val={val_dice_epoch:.4f} | Best={best_metric:.4f}"
                         f" | r_med={r_median_val:.4f} r_p90={r_p90_val:.4f}")
         log_str += f" | LR={get_lr(optimizer):.6f} | {elapsed:.1f}s"
-        print(log_str)
+        print(log_str, flush=True)
 
         with open(log_path, "a", newline="") as f:
             csv.writer(f).writerow([
@@ -1061,6 +1081,12 @@ def main():
         "--max_channels", type=int, default=512,
         help="Cap on DynUNet filter count per level (default 512).",
     )
+    parser.add_argument(
+        "--sw_batch_size", type=int, default=1,
+        help="Sliding-window batch size at validation (default 1). Each "
+             "window holds a full DynUNet activation graph; raise only on "
+             "GPUs with plenty of memory.",
+    )
     args = parser.parse_args()
 
     # Apply path overrides.
@@ -1114,13 +1140,16 @@ def main():
 
     if args.fold is not None:
         fold_info = next(fo for fo in folds if fo["fold"] == args.fold)
-        train_fold(fold_info, fp, device, smoke=args.smoke, max_epochs=args.epochs)
+        train_fold(fold_info, fp, device, smoke=args.smoke, max_epochs=args.epochs,
+                   sw_batch_size=args.sw_batch_size)
     elif args.smoke:
         # Smoke runs fold 0 only.
-        train_fold(folds[0], fp, device, smoke=True, max_epochs=args.epochs or 2)
+        train_fold(folds[0], fp, device, smoke=True, max_epochs=args.epochs or 2,
+                   sw_batch_size=args.sw_batch_size)
     else:
         for fold_info in folds:
-            train_fold(fold_info, fp, device, max_epochs=args.epochs)
+            train_fold(fold_info, fp, device, max_epochs=args.epochs,
+                       sw_batch_size=args.sw_batch_size)
 
     print("\n" + "=" * 70)
     print("DONE.")

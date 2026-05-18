@@ -78,6 +78,8 @@ export TORCHDYNAMO_DISABLE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Make `from mri_edain_v2 import ...` work from anywhere.
 export PYTHONPATH="$SLURM_SUBMIT_DIR"
+# Unbuffered stdout so per-epoch progress shows up in slurm-*.out immediately.
+export PYTHONUNBUFFERED=1
 
 echo "Fold: 0 | Start: $(date)"
 
